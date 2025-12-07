@@ -31,17 +31,17 @@ Relay acts as the **Delivery Service** for MLS, providing:
 
 ## Repository Structure
 
-- **[`protocol.md`](protocol.md)** - Relay protocol specification
-- **[`relay/`](relay/)** - Reference implementation in Rust
+- [protocol.md](protocol.md) - Relay protocol specification
+- [relay-rs/](relay-rs/) - Reference implementation in Rust
 
 ## Quick Start
 
 ```bash
-cd relay
+cd relay-rs
 cargo run
 ```
 
-See [relay/README.md](relay/README.md) for detailed usage instructions.
+See [relay-rs/README.md](relay-rs/README.md) for detailed usage instructions.
 
 ## Protocol Topics
 
