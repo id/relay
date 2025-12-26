@@ -1,534 +1,553 @@
+//! Relay Reference Client
+//!
+//! A minimal implementation of the Relay protocol (MLS over MQTT).
+//! Designed for clarity and ease of translation to other languages.
+
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aes_gcm::aead::{generic_array::GenericArray, Aead};
-use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
 use anyhow::{anyhow, Result};
-use curve25519_dalek::montgomery::MontgomeryPoint;
-use curve25519_dalek::scalar::Scalar;
-use hkdf::Hkdf;
+use chrono::Local;
 use rand::Rng;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::task;
+use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
+use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
-use ::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
-use openmls::credentials::CredentialWithKey;
-use openmls::group::{MlsGroupCreateConfig, MlsGroupJoinConfig, StagedWelcome};
-use openmls::key_packages::KeyPackage;
 use openmls::prelude::*;
-use openmls::treesync::RatchetTreeIn;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use openmls_traits::OpenMlsProvider;
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+fn log(msg: &str) {
+    let ts = Local::now().format("%H:%M:%S");
+    println!("\r[{}] {}", ts, msg);
+}
+
+fn log_msg(sender: &str, text: &str, is_self: bool) {
+    let ts = Local::now().format("%H:%M:%S");
+    let color = if is_self { "34" } else { "32" }; // blue for self, green for peer
+    let name = if is_self { "you" } else { sender };
+    println!("\r[{}] \x1b[{}m<{}>\x1b[0m {}", ts, color, name, text);
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 const BROKER_HOST: &str = "broker.emqx.io";
 const BROKER_PORT: u16 = 1883;
-const TOPIC_PREFIX: &str = "relay";
+const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SealedEnvelope {
-    version: u8,
-    #[serde(with = "serde_bytes")]
-    ephemeral_public_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    encrypted_payload: Vec<u8>,
-    pow_nonce: u64,
+// ============================================================================
+// Application State
+// ============================================================================
+
+struct RelayClient {
+    // MLS
+    backend: OpenMlsRustCrypto,
+    client_id: String,
+    signer: SignatureKeyPair,
+    credential: CredentialWithKey,
+
+    // MQTT
+    mqtt: Client,
+
+    // State
+    key_packages: HashMap<String, KeyPackage>, // peer_id -> KeyPackage
+    groups: HashMap<String, MlsGroup>,         // peer_id -> MlsGroup
+    group_peers: HashMap<String, String>,      // group_id (hex) -> peer_id
+    pending_connects: Vec<String>,             // peer_ids waiting for KeyPackage
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InnerPayload {
-    msg_type: u8,
-    sender_user_id: String,
-    #[serde(with = "serde_bytes")]
-    sender_identity_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    content: Vec<u8>,
-    // Optional: Include ratchet tree or other out-of-band info
-    #[serde(with = "serde_bytes")]
-    ratchet_tree: Vec<u8>,
-    // Sender's outer public key for sealed sender
-    #[serde(with = "serde_bytes")]
-    sender_outer_public_key: Vec<u8>,
-}
+// ============================================================================
+// Initialization
+// ============================================================================
 
-#[derive(Serialize, Deserialize)]
-struct PublicBundle {
-    key_package: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    sealed_sender_public_key: Vec<u8>,
-}
+impl RelayClient {
+    fn new() -> Result<(Self, rumqttc::Connection)> {
+        let backend = OpenMlsRustCrypto::default();
 
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    content: String,
-}
+        // Generate client identity
+        let client_id = hex::encode(rand::thread_rng().gen::<[u8; 16]>());
+        let credential = BasicCredential::new(client_id.clone().into_bytes());
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+            .map_err(|e| anyhow!("KeyGen error: {:?}", e))?;
+        signer
+            .store(backend.storage())
+            .map_err(|e| anyhow!("Storage error: {:?}", e))?;
 
-struct AppState {
-    backend: Arc<OpenMlsRustCrypto>,
-    user_id: String,
-    signer: Arc<SignatureKeyPair>,
-    credential_with_key: CredentialWithKey,
-    key_package: KeyPackage,
-    outer_secret: Scalar,
-    #[allow(dead_code)]
-    outer_public: MontgomeryPoint,
-    peer_bundles: HashMap<String, PublicBundle>,
-    peer_outer_keys: HashMap<String, Vec<u8>>, // Just the outer public keys
-    groups: HashMap<String, MlsGroup>,
-}
-
-fn generate_outer_keys() -> (Scalar, MontgomeryPoint) {
-    let mut rng = rand::thread_rng();
-    let secret = Scalar::random(&mut rng);
-    let public = MontgomeryPoint::mul_base(&secret);
-    (secret, public)
-}
-
-fn seal_message(payload: &InnerPayload, peer_public_bytes: &[u8]) -> Result<SealedEnvelope> {
-    let mut payload_bytes = Vec::new();
-    ciborium::into_writer(payload, &mut payload_bytes)?;
-
-    let (eph_sec, eph_pub) = generate_outer_keys();
-    let peer_point = MontgomeryPoint(
-        peer_public_bytes
-            .try_into()
-            .map_err(|_| anyhow!("Invalid Key"))?,
-    );
-    let shared_secret = eph_sec * peer_point;
-
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-    let mut key_bytes = [0u8; 32];
-    hkdf.expand(b"relay-seal-v1", &mut key_bytes).unwrap();
-
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key_bytes));
-    let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
-    let ciphertext = cipher
-        .encrypt(&nonce, payload_bytes.as_ref())
-        .map_err(|_| anyhow!("Encrypt Fail"))?;
-
-    let mut final_ct = nonce.to_vec();
-    final_ct.extend(ciphertext);
-
-    let mut envelope = SealedEnvelope {
-        version: 1,
-        ephemeral_public_key: eph_pub.as_bytes().to_vec(),
-        encrypted_payload: final_ct,
-        pow_nonce: 0,
-    };
-
-    print!("Mining PoW...");
-    io::stdout().flush()?;
-    loop {
-        let mut hasher = Sha256::new();
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&envelope, &mut bytes)?;
-        hasher.update(&bytes);
-        let hash = hasher.finalize();
-        if hash[0] == 0 && hash[1] == 0 {
-            println!(" Done!");
-            break;
-        }
-        envelope.pow_nonce += 1;
-    }
-    Ok(envelope)
-}
-
-fn unseal_message(envelope: &SealedEnvelope, my_secret: Scalar) -> Result<InnerPayload> {
-    let mut hasher = Sha256::new();
-    let mut bytes = Vec::new();
-    ciborium::into_writer(envelope, &mut bytes)?;
-    hasher.update(&bytes);
-    let hash = hasher.finalize();
-    if hash[0] != 0 || hash[1] != 0 {
-        return Err(anyhow!("Invalid PoW"));
-    }
-
-    let eph_point = MontgomeryPoint(
-        envelope
-            .ephemeral_public_key
-            .clone()
-            .try_into()
-            .map_err(|_| anyhow!("Key"))?,
-    );
-    let shared = my_secret * eph_point;
-
-    let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
-    let mut key_bytes = [0u8; 32];
-    hkdf.expand(b"relay-seal-v1", &mut key_bytes).unwrap();
-
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key_bytes));
-    if envelope.encrypted_payload.len() < 12 {
-        return Err(anyhow!("Short"));
-    }
-    let (nonce, ct) = envelope.encrypted_payload.split_at(12);
-
-    let plain = cipher
-        .decrypt(GenericArray::from_slice(nonce), ct)
-        .map_err(|_| anyhow!("Decrypt Fail"))?;
-    Ok(ciborium::from_reader(plain.as_slice())?)
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let backend = OpenMlsRustCrypto::default();
-
-    let user_id = hex::encode(rand::thread_rng().gen::<[u8; 16]>());
-    println!(">>> My User ID: {}", user_id);
-
-    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
-
-    let credential = BasicCredential::new(user_id.clone().into_bytes());
-    let signature_keys = SignatureKeyPair::new(ciphersuite.signature_algorithm())
-        .map_err(|e| anyhow!("KeyGen Error: {:?}", e))?;
-
-    signature_keys
-        .store(backend.storage())
-        .map_err(|e| anyhow!("Storage Error: {:?}", e))?;
-
-    let credential_with_key = CredentialWithKey {
-        credential: credential.into(),
-        signature_key: signature_keys.public().into(),
-    };
-
-    let key_package_bundle = KeyPackage::builder().build(
-        ciphersuite,
-        &backend,
-        &signature_keys,
-        credential_with_key.clone(),
-    )?;
-
-    let key_package = key_package_bundle.key_package().clone();
-
-    let (outer_secret, outer_public) = generate_outer_keys();
-
-    let state = Arc::new(Mutex::new(AppState {
-        backend: Arc::new(backend),
-        user_id: user_id.clone(),
-        signer: Arc::new(signature_keys),
-        credential_with_key,
-        key_package: key_package.clone(),
-        outer_secret,
-        outer_public,
-        peer_bundles: HashMap::new(),
-        peer_outer_keys: HashMap::new(),
-        groups: HashMap::new(),
-    }));
-
-    let mut mqttoptions = MqttOptions::new(&user_id, BROKER_HOST, BROKER_PORT);
-    mqttoptions.set_keep_alive(Duration::from_secs(60));
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-
-    let kp_msg_out = MlsMessageOut::from(state.lock().unwrap().key_package.clone());
-    let bundle = PublicBundle {
-        key_package: kp_msg_out.tls_serialize_detached()?,
-        sealed_sender_public_key: outer_public.as_bytes().to_vec(),
-    };
-    client
-        .publish(
-            format!("{}/u/{}/keys", TOPIC_PREFIX, user_id),
-            QoS::AtLeastOnce,
-            true,
-            serde_json::to_vec(&bundle)?,
-        )
-        .await?;
-    client
-        .subscribe(
-            format!("{}/u/{}/inbox", TOPIC_PREFIX, user_id),
-            QoS::AtLeastOnce,
-        )
-        .await?;
-
-    let state_clone = state.clone();
-
-    task::spawn(async move {
-        while let Ok(event) = eventloop.poll().await {
-            if let Event::Incoming(Packet::Publish(p)) = event {
-                let topic = p.topic.clone();
-                if topic.ends_with("/inbox") {
-                    match process_inbox(&p.payload, &state_clone) {
-                        Ok((sender, msg)) => {
-                            println!("\r\x1b[32m<{}>\x1b[0m {}", sender, msg);
-                            print!("> ");
-                            io::stdout().flush().unwrap();
-                        }
-                        Err(e) => eprintln!("Error processing inbox: {:?}", e),
-                    }
-                } else if topic.ends_with("/keys") {
-                    if let Ok(bundle) = serde_json::from_slice::<PublicBundle>(&p.payload) {
-                        let parts: Vec<&str> = topic.split('/').collect();
-                        if parts.len() >= 3 {
-                            let peer_id = parts[2].to_string();
-                            state_clone
-                                .lock()
-                                .unwrap()
-                                .peer_bundles
-                                .insert(peer_id.clone(), bundle);
-                            println!("\r[System] Received keys for {}. Ready to chat.", peer_id);
-                            print!("> ");
-                            io::stdout().flush().unwrap();
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let stdin = io::stdin();
-    print!("> ");
-    io::stdout().flush()?;
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        match parts[0] {
-            "info" => println!("ID: {}", user_id),
-            "connect" => {
-                if parts.len() < 2 {
-                    println!("Usage: connect <peer_id>");
-                    continue;
-                }
-                let peer = parts[1];
-                client
-                    .subscribe(
-                        format!("{}/u/{}/keys", TOPIC_PREFIX, peer),
-                        QoS::AtLeastOnce,
-                    )
-                    .await?;
-                println!("Fetching keys...");
-            }
-            "chat" => {
-                if parts.len() < 3 {
-                    println!("Usage: chat <peer_id> <msg>");
-                    continue;
-                }
-                let peer = parts[1];
-                let msg = parts[2..].join(" ");
-                if let Err(e) = send_chat(&client, &state, peer, &msg).await {
-                    println!("Error sending: {:?}", e);
-                }
-            }
-            _ => println!("cmds: info, connect, chat"),
-        }
-        print!("> ");
-        io::stdout().flush()?;
-    }
-    Ok(())
-}
-
-fn process_inbox(payload: &[u8], state: &Arc<Mutex<AppState>>) -> Result<(String, String)> {
-    let (my_secret, backend) = {
-        let g = state.lock().unwrap();
-        (g.outer_secret, g.backend.clone())
-    };
-
-    let envelope: SealedEnvelope = ciborium::from_reader(payload)?;
-    let inner = unseal_message(&envelope, my_secret)?;
-
-    let mut g = state.lock().unwrap();
-
-    // Store sender's outer public key for future replies
-    if !inner.sender_outer_public_key.is_empty() {
-        g.peer_outer_keys.insert(
-            inner.sender_user_id.clone(),
-            inner.sender_outer_public_key.clone(),
-        );
-    }
-
-    if inner.msg_type == 3 {
-        // Welcome message
-        let serialized_welcome = inner.content;
-
-        let mls_message_in = MlsMessageIn::tls_deserialize(&mut serialized_welcome.as_slice())?;
-
-        let welcome = match mls_message_in.extract() {
-            MlsMessageBodyIn::Welcome(welcome) => welcome,
-            _ => return Err(anyhow!("Expected Welcome message")),
+        let credential = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.public().into(),
         };
 
-        let group_config = MlsGroupJoinConfig::builder().build();
+        // Connect to MQTT broker
+        let mut options = MqttOptions::new(&client_id, BROKER_HOST, BROKER_PORT);
+        options.set_keep_alive(Duration::from_secs(60));
+        let (mqtt, connection) = Client::new(options, 100);
 
-        // Deserialize ratchet tree if present
-        let ratchet_tree_option = if inner.ratchet_tree.is_empty() {
-            None
-        } else {
-            let rt: RatchetTreeIn =
-                TlsDeserialize::tls_deserialize(&mut inner.ratchet_tree.as_slice())?;
-            Some(rt)
-        };
+        Ok((
+            Self {
+                backend,
+                client_id,
+                signer,
+                credential,
+                mqtt,
+                key_packages: HashMap::new(),
+                groups: HashMap::new(),
+                group_peers: HashMap::new(),
+                pending_connects: Vec::new(),
+            },
+            connection,
+        ))
+    }
 
-        let staged_welcome = StagedWelcome::new_from_welcome(
-            &*backend,
-            &group_config,
-            welcome,
-            ratchet_tree_option,
+    fn publish_key_package(&self) -> Result<()> {
+        let key_package = KeyPackage::builder()
+            .build(
+                CIPHERSUITE,
+                &self.backend,
+                &self.signer,
+                self.credential.clone(),
+            )?
+            .key_package()
+            .clone();
+
+        // Serialize as MLSMessage, wrap in CBOR array per protocol spec
+        let kp_bytes = MlsMessageOut::from(key_package).tls_serialize_detached()?;
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&vec![kp_bytes], &mut cbor)?;
+
+        self.mqtt.publish(
+            format!("relay/k/{}", self.client_id),
+            QoS::AtLeastOnce,
+            true, // retained
+            cbor,
         )?;
+        Ok(())
+    }
 
-        let group = staged_welcome.into_group(&*backend)?;
+    fn subscribe_welcome(&self) -> Result<()> {
+        self.mqtt
+            .subscribe(format!("relay/w/{}", self.client_id), QoS::AtLeastOnce)?;
+        Ok(())
+    }
+}
 
-        g.groups.insert(inner.sender_user_id.clone(), group);
-        Ok((inner.sender_user_id, "--- Session Established ---".into()))
-    } else if inner.msg_type == 5 {
-        // Application message
-        let group = g
-            .groups
-            .get_mut(&inner.sender_user_id)
-            .ok_or(anyhow!("No Group"))?;
+// ============================================================================
+// MQTT Message Handlers
+// ============================================================================
 
-        let msg_in: MlsMessageIn = TlsDeserialize::tls_deserialize(&mut inner.content.as_slice())?;
+impl RelayClient {
+    fn handle_key_package(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
+        // Parse peer_id from topic: relay/k/{peer_id}
+        let peer_id = topic
+            .strip_prefix("relay/k/")
+            .ok_or_else(|| anyhow!("Invalid topic"))?;
 
-        let protocol_msg = match msg_in.extract() {
-            MlsMessageBodyIn::PrivateMessage(pm) => ProtocolMessage::from(pm),
-            MlsMessageBodyIn::PublicMessage(pm) => ProtocolMessage::from(pm),
-            _ => return Err(anyhow!("Unexpected message type in inbox")),
+        if peer_id == self.client_id {
+            return Ok(()); // Ignore our own KeyPackage
+        }
+
+        // Decode CBOR array of KeyPackages
+        let kp_array: Vec<Vec<u8>> = ciborium::from_reader(payload)?;
+        let kp_bytes = kp_array.first().ok_or_else(|| anyhow!("Empty array"))?;
+
+        // Deserialize and validate KeyPackage
+        let msg = MlsMessageIn::tls_deserialize(&mut kp_bytes.as_slice())?;
+        let kp = match msg.extract() {
+            MlsMessageBodyIn::KeyPackage(kp) => {
+                kp.validate(self.backend.crypto(), ProtocolVersion::Mls10)?
+            }
+            _ => return Err(anyhow!("Expected KeyPackage")),
         };
 
-        let processed = group.process_message(&*backend, protocol_msg)?;
+        self.key_packages.insert(peer_id.to_string(), kp);
+
+        // If this peer had a pending connect, establish session now
+        if let Some(pos) = self.pending_connects.iter().position(|p| p == peer_id) {
+            self.pending_connects.remove(pos);
+            self.create_group(peer_id)?;
+            log(&format!("Session established with {}", peer_id));
+        } else {
+            log(&format!("Received KeyPackage for {}", peer_id));
+        }
+        Ok(())
+    }
+
+    fn handle_welcome(&mut self, payload: &[u8]) -> Result<()> {
+        // Deserialize Welcome
+        let msg = MlsMessageIn::tls_deserialize(&mut payload.to_vec().as_slice())?;
+        let welcome = match msg.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => return Err(anyhow!("Expected Welcome")),
+        };
+
+        // Join group
+        let config = MlsGroupJoinConfig::builder().build();
+        let group = StagedWelcome::new_from_welcome(&self.backend, &config, welcome, None)?
+            .into_group(&self.backend)?;
+
+        let group_id = hex::encode(group.group_id().as_slice());
+
+        // Find peer (the other member)
+        let peer_id = group
+            .members()
+            .find_map(|m| {
+                let id = String::from_utf8(m.credential.serialized_content().to_vec()).ok()?;
+                if id != self.client_id {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Subscribe to group messages
+        self.mqtt
+            .subscribe(format!("relay/g/{}/m", group_id), QoS::AtLeastOnce)?;
+
+        self.group_peers.insert(group_id, peer_id.clone());
+        self.groups.insert(peer_id.clone(), group);
+
+        // Publish a fresh KeyPackage (our old one was consumed)
+        self.publish_key_package()?;
+
+        log(&format!("Session established with {}", peer_id));
+        log(&format!("Use 'chat {} <message>' to reply", peer_id));
+        Ok(())
+    }
+
+    fn handle_group_message(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
+        // Parse group_id from topic: relay/g/{group_id}/m
+        let group_id = topic
+            .strip_prefix("relay/g/")
+            .and_then(|s| s.strip_suffix("/m"))
+            .ok_or_else(|| anyhow!("Invalid topic"))?;
+
+        let peer_id = self
+            .group_peers
+            .get(group_id)
+            .ok_or_else(|| anyhow!("Unknown group"))?
+            .clone();
+
+        let group = self
+            .groups
+            .get_mut(&peer_id)
+            .ok_or_else(|| anyhow!("No group"))?;
+
+        // Deserialize MLS message
+        let msg = MlsMessageIn::tls_deserialize(&mut payload.to_vec().as_slice())?;
+        let protocol_msg = match msg.extract() {
+            MlsMessageBodyIn::PrivateMessage(m) => ProtocolMessage::from(m),
+            MlsMessageBodyIn::PublicMessage(m) => ProtocolMessage::from(m),
+            _ => return Err(anyhow!("Expected PrivateMessage or PublicMessage")),
+        };
+
+        // Process message
+        let processed = match group.process_message(&self.backend, protocol_msg) {
+            Ok(p) => p,
+            Err(ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage)) => {
+                return Ok(())
+            } // Skip own messages
+            Err(e) => return Err(anyhow!("MLS error: {:?}", e)),
+        };
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
                 let bytes = app_msg.into_bytes();
-                let cm: ChatMessage = serde_json::from_slice(&bytes)?;
-                Ok((inner.sender_user_id, cm.content))
-            }
-            ProcessedMessageContent::ProposalMessage(_) => {
-                Ok((inner.sender_user_id, "[Proposal]".into()))
+                let text = String::from_utf8_lossy(&bytes);
+                log_msg(&peer_id, &text, false);
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
-                group.merge_staged_commit(&*backend, *staged)?;
-                Ok((inner.sender_user_id, "[Commit Merged]".into()))
+                group.merge_staged_commit(&self.backend, *staged)?;
             }
-            _ => Ok((inner.sender_user_id, "[Unhandled Message]".into())),
+            _ => {}
         }
-    } else {
-        Err(anyhow!("Unknown Type"))
+        Ok(())
     }
 }
 
-async fn send_chat(
-    client: &AsyncClient,
-    state: &Arc<Mutex<AppState>>,
-    peer: &str,
-    text: &str,
-) -> Result<()> {
-    let (payload, _peer_key) = {
-        // Scope for lock
-        let mut g = state.lock().unwrap();
+// ============================================================================
+// Commands
+// ============================================================================
 
-        // Clone Arcs to share access
-        let backend = g.backend.clone();
-        let signer = g.signer.clone();
-        let credential_with_key = g.credential_with_key.clone();
-        let user_id = g.user_id.clone();
-
-        let has_group = g.groups.contains_key(peer);
-
-        if !has_group {
-            let bundle = g
-                .peer_bundles
-                .get(peer)
-                .ok_or(anyhow!("Unknown peer (run connect)"))?;
-            let peer_pk = bundle.sealed_sender_public_key.clone();
-
-            // Deserialize and validate KeyPackage
-            let msg_in: MlsMessageIn =
-                TlsDeserialize::tls_deserialize(&mut bundle.key_package.as_slice())?;
-            let kp_in = match msg_in.extract() {
-                MlsMessageBodyIn::KeyPackage(kp) => kp,
-                _ => return Err(anyhow!("Expected KeyPackage")),
-            };
-
-            let kp = kp_in
-                .validate(backend.crypto(), ProtocolVersion::Mls10)
-                .map_err(|e| anyhow!("KeyPackage validation failed: {:?}", e))?;
-
-            let group_config = MlsGroupCreateConfig::builder()
-                .ciphersuite(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
-                .build();
-
-            // Use deref for &impl OpenMlsProvider and &SignatureKeyPair
-            let mut group = MlsGroup::new(
-                &*backend,
-                &*signer,
-                &group_config,
-                credential_with_key.clone(),
-            )?;
-
-            let (_msg_out, welcome, _info) = group.add_members(&*backend, &*signer, &[kp])?;
-
-            // Merge pending commit before exporting ratchet tree
-            group.merge_pending_commit(&*backend)?;
-
-            // Export ratchet tree AFTER merging so it matches the Welcome's GroupInfo
-            let ratchet_tree = group.export_ratchet_tree();
-            let ratchet_tree_bytes = ratchet_tree.tls_serialize_detached()?;
-
-            g.groups.insert(peer.to_string(), group);
-
-            let sender_outer_pk = g.outer_public.as_bytes().to_vec();
-            let welcome_inner = InnerPayload {
-                msg_type: 3,
-                sender_user_id: user_id.clone(),
-                sender_identity_key: vec![],
-                content: welcome.tls_serialize_detached()?,
-                ratchet_tree: ratchet_tree_bytes,
-                sender_outer_public_key: sender_outer_pk,
-            };
-            let welcome_sealed = seal_message(&welcome_inner, &peer_pk)?;
-            let mut buf = Vec::new();
-            ciborium::into_writer(&welcome_sealed, &mut buf)?;
-            client
-                .publish(
-                    format!("{}/u/{}/inbox", TOPIC_PREFIX, peer),
-                    QoS::AtLeastOnce,
-                    false,
-                    buf,
-                )
-                .await?;
+impl RelayClient {
+    fn connect(&mut self, peer_id: &str) -> Result<()> {
+        if self.groups.contains_key(peer_id) {
+            log(&format!("Already connected to {}", peer_id));
+            return Ok(());
         }
 
-        let group = g.groups.get_mut(peer).unwrap();
-        let cm = ChatMessage {
-            content: text.to_string(),
-        };
-        let mls_msg_out = group.create_message(&*backend, &*signer, &serde_json::to_vec(&cm)?)?;
+        // If we already have their KeyPackage, establish session immediately
+        if self.key_packages.contains_key(peer_id) {
+            self.create_group(peer_id)?;
+            log(&format!("Session established with {}", peer_id));
+            return Ok(());
+        }
 
-        let sender_outer_pk = g.outer_public.as_bytes().to_vec();
-        let inner = InnerPayload {
-            msg_type: 5,
-            sender_user_id: user_id,
-            sender_identity_key: vec![],
-            content: mls_msg_out.tls_serialize_detached()?,
-            ratchet_tree: vec![],
-            sender_outer_public_key: sender_outer_pk,
-        };
+        // Otherwise, fetch KeyPackage and mark as pending
+        self.pending_connects.push(peer_id.to_string());
+        self.mqtt
+            .subscribe(format!("relay/k/{}", peer_id), QoS::AtLeastOnce)?;
+        log(&format!("Connecting to {}...", peer_id));
+        Ok(())
+    }
 
-        // Get peer's outer public key from bundle or from stored keys
-        let peer_pk = g
-            .peer_bundles
-            .get(peer)
-            .map(|b| b.sealed_sender_public_key.clone())
-            .or_else(|| g.peer_outer_keys.get(peer).cloned())
-            .ok_or(anyhow!("No peer public key available"))?;
-        (seal_message(&inner, &peer_pk)?, peer_pk)
-    };
+    fn send(&mut self, peer_id: &str, text: &str) -> Result<()> {
+        // Try to find group by peer_id or partial match
+        let peer = self.find_peer(peer_id)?;
 
-    let mut buf = Vec::new();
-    ciborium::into_writer(&payload, &mut buf)?;
-    client
-        .publish(
-            format!("{}/u/{}/inbox", TOPIC_PREFIX, peer),
+        // Must have an active session
+        if !self.groups.contains_key(&peer) {
+            return Err(anyhow!(
+                "No session with {}. Use 'connect {}' first.",
+                peer,
+                peer
+            ));
+        }
+
+        let group = self.groups.get_mut(&peer).unwrap();
+        let group_id = hex::encode(group.group_id().as_slice());
+
+        // Create and send message
+        let mls_msg = group.create_message(&self.backend, &self.signer, text.as_bytes())?;
+        let msg_bytes = mls_msg.tls_serialize_detached()?;
+
+        self.mqtt.publish(
+            format!("relay/g/{}/m", group_id),
             QoS::AtLeastOnce,
             false,
-            buf,
-        )
-        .await?;
+            msg_bytes,
+        )?;
+
+        // Show sent message locally
+        log_msg("", text, true);
+        Ok(())
+    }
+
+    fn find_peer(&self, query: &str) -> Result<String> {
+        // Exact match in groups
+        if self.groups.contains_key(query) {
+            return Ok(query.to_string());
+        }
+
+        // Exact match in key_packages
+        if self.key_packages.contains_key(query) {
+            return Ok(query.to_string());
+        }
+
+        // Partial match in groups (prefix)
+        let group_matches: Vec<_> = self
+            .groups
+            .keys()
+            .filter(|k| k.starts_with(query))
+            .collect();
+        if group_matches.len() == 1 {
+            return Ok(group_matches[0].clone());
+        }
+
+        // Partial match in key_packages (prefix)
+        let kp_matches: Vec<_> = self
+            .key_packages
+            .keys()
+            .filter(|k| k.starts_with(query))
+            .collect();
+        if kp_matches.len() == 1 {
+            return Ok(kp_matches[0].clone());
+        }
+
+        // Show available peers
+        let mut available = vec![];
+        for peer in self.groups.keys() {
+            available.push(format!("{} (session)", peer));
+        }
+        for peer in self.key_packages.keys() {
+            if !self.groups.contains_key(peer) {
+                available.push(format!("{} (keypackage)", peer));
+            }
+        }
+
+        if available.is_empty() {
+            Err(anyhow!(
+                "No peers available. Use 'connect <peer_id>' first."
+            ))
+        } else {
+            Err(anyhow!(
+                "Unknown peer '{}'. Available:\n  {}",
+                query,
+                available.join("\n  ")
+            ))
+        }
+    }
+
+    fn create_group(&mut self, peer_id: &str) -> Result<()> {
+        let peer_kp = self
+            .key_packages
+            .get(peer_id)
+            .ok_or_else(|| anyhow!("No KeyPackage for peer (use 'connect' first)"))?
+            .clone();
+
+        // Generate random group_id
+        let group_id_bytes: [u8; 16] = rand::thread_rng().gen();
+        let group_id = hex::encode(group_id_bytes);
+
+        // Create group
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .build();
+
+        let mut group = MlsGroup::new_with_group_id(
+            &self.backend,
+            &self.signer,
+            &config,
+            GroupId::from_slice(&group_id_bytes),
+            self.credential.clone(),
+        )?;
+
+        // Add peer
+        let (_, welcome, group_info) =
+            group.add_members(&self.backend, &self.signer, &[peer_kp])?;
+        group.merge_pending_commit(&self.backend)?;
+
+        // Publish GroupInfo (retained)
+        self.mqtt.publish(
+            format!("relay/g/{}/i", group_id),
+            QoS::AtLeastOnce,
+            true,
+            group_info.tls_serialize_detached()?,
+        )?;
+
+        // Send Welcome
+        self.mqtt.publish(
+            format!("relay/w/{}", peer_id),
+            QoS::AtLeastOnce,
+            false,
+            welcome.tls_serialize_detached()?,
+        )?;
+
+        // Subscribe to group messages
+        self.mqtt
+            .subscribe(format!("relay/g/{}/m", group_id), QoS::AtLeastOnce)?;
+
+        self.group_peers.insert(group_id, peer_id.to_string());
+        self.groups.insert(peer_id.to_string(), group);
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Main Loop
+// ============================================================================
+
+fn main() -> Result<()> {
+    let (mut client, mut connection) = RelayClient::new()?;
+
+    println!("Client ID: {}", client.client_id);
+
+    client.publish_key_package()?;
+    client.subscribe_welcome()?;
+
+    // Channel for MQTT events
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Spawn MQTT event loop in background thread
+    std::thread::spawn(move || {
+        for event in connection.iter() {
+            if let Ok(Event::Incoming(Packet::Publish(p))) = event {
+                let _ = tx.send((p.topic.clone(), p.payload.to_vec()));
+            }
+        }
+    });
+
+    // Channel for stdin lines
+    let (stdin_tx, stdin_rx) = std::sync::mpsc::channel();
+
+    // Spawn stdin reader in background thread
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines().map_while(Result::ok) {
+            let _ = stdin_tx.send(line);
+        }
+    });
+
+    print!("> ");
+    io::stdout().flush()?;
+
+    loop {
+        // Check for MQTT messages (non-blocking)
+        while let Ok((topic, payload)) = rx.try_recv() {
+            let result = if topic.starts_with("relay/k/") {
+                client.handle_key_package(&topic, &payload)
+            } else if topic.starts_with("relay/w/") {
+                client.handle_welcome(&payload)
+            } else if topic.starts_with("relay/g/") && topic.ends_with("/m") {
+                client.handle_group_message(&topic, &payload)
+            } else {
+                Ok(())
+            };
+
+            if let Err(e) = result {
+                eprintln!("\rError: {:?}", e);
+            }
+            print!("> ");
+            io::stdout().flush()?;
+        }
+
+        // Check for stdin input (non-blocking)
+        if let Ok(line) = stdin_rx.try_recv() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                print!("> ");
+                io::stdout().flush()?;
+                continue;
+            }
+
+            let result = match parts[0] {
+                "info" => {
+                    println!("Client ID: {}", client.client_id);
+                    Ok(())
+                }
+                "peers" => {
+                    if client.groups.is_empty() && client.key_packages.is_empty() {
+                        println!("No peers. Use 'connect <peer_id>' to connect.");
+                    } else {
+                        println!("Active sessions:");
+                        for peer in client.groups.keys() {
+                            println!("  {} (session)", peer);
+                        }
+                        for peer in client.key_packages.keys() {
+                            if !client.groups.contains_key(peer) {
+                                println!("  {} (keypackage only)", peer);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                "connect" if parts.len() >= 2 => client.connect(parts[1]),
+                "chat" if parts.len() >= 3 => client.send(parts[1], &parts[2..].join(" ")),
+                "quit" | "exit" => break,
+                _ => {
+                    println!("Commands: info, peers, connect <peer>, chat <peer> <msg>, quit");
+                    Ok(())
+                }
+            };
+
+            if let Err(e) = result {
+                println!("Error: {:?}", e);
+            }
+            print!("> ");
+            io::stdout().flush()?;
+        }
+
+        // Small sleep to avoid busy-waiting
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     Ok(())
 }
