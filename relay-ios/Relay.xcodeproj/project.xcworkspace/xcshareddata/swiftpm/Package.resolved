@@ -1,0 +1,24 @@
+{
+  "originHash" : "85034dfa0a015690a72b52bd97dc1c0c683c4383fab1b51e9ade00f6f2560009",
+  "pins" : [
+    {
+      "identity" : "swift-mqtt",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/emqx/swift-mqtt",
+      "state" : {
+        "branch" : "main",
+        "revision" : "88c6498938d72affb04ae50e20d249521d575064"
+      }
+    },
+    {
+      "identity" : "swift-promise",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sutext/swift-promise",
+      "state" : {
+        "revision" : "8baedd0938795732164ab6ea426a47bf2eb1d730",
+        "version" : "2.2.0"
+      }
+    }
+  ],
+  "version" : 3
+}

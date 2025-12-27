@@ -29,15 +29,7 @@ Relay acts as the **Delivery Service** for MLS, providing:
 
 - [protocol.md](protocol.md) - Relay protocol specification
 - [relay-rs/](relay-rs/) - Reference implementation in Rust
-
-## Quick Start
-
-```bash
-cd relay-rs
-cargo run
-```
-
-See [relay-rs/README.md](relay-rs/README.md) for detailed usage instructions.
+- [relay-ios/](relay-ios/) - Native iOS client for the Relay protocol
 
 ## Protocol Topics
 
