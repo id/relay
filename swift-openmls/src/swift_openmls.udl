@@ -1,0 +1,57 @@
+namespace swift_openmls {
+    [Throws=OpenMlsError]
+    ClientIdentity generate_client_identity(string client_id);
+    
+    [Throws=OpenMlsError]
+    KeyPackageBundle create_key_package(string client_id);
+};
+
+[Error]
+enum OpenMlsError {
+    "MlsError",
+    "SerializationError", 
+    "InvalidInput",
+    "GroupNotFound"
+};
+
+dictionary ClientIdentity {
+    string client_id;
+    sequence<u8> credential_bytes;
+    sequence<u8> signature_public_key;
+};
+
+dictionary KeyPackageBundle {
+    sequence<u8> key_package_bytes;
+    sequence<u8> key_package_hash;
+};
+
+dictionary AddMemberResult {
+    sequence<u8> welcome_bytes;
+    sequence<u8> commit_bytes;
+};
+
+dictionary DecryptedMessage {
+    sequence<u8> plaintext;
+    string sender_client_id;
+};
+
+interface OpenMlsGroup {
+    [Throws=OpenMlsError, Name=new]
+    constructor(string group_id, string client_id);
+    
+    [Throws=OpenMlsError, Name=join_from_welcome]
+    constructor(sequence<u8> welcome_bytes, string client_id);
+    
+    [Throws=OpenMlsError]
+    AddMemberResult add_member(sequence<u8> key_package_bytes);
+    
+    [Throws=OpenMlsError]
+    sequence<u8> encrypt(sequence<u8> plaintext);
+    
+    [Throws=OpenMlsError]
+    DecryptedMessage decrypt(sequence<u8> ciphertext_bytes);
+    
+    string group_id();
+    
+    sequence<string> members();
+};

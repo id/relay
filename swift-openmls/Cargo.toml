@@ -1,0 +1,27 @@
+[package]
+name = "swift-openmls"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "swift_openmls"
+
+[dependencies]
+uniffi = { version = "0.30", features = ["cli"] }
+openmls = "0.7.1"
+openmls_rust_crypto = "0.4"
+openmls_basic_credential = "0.4"
+tls_codec = "0.4"
+hex = "0.4"
+rand = "0.9"
+thiserror = "2.0"
+
+[build-dependencies]
+uniffi = { version = "0.30", features = ["build"] }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce code size further
+strip = true        # Strip symbols

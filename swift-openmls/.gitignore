@@ -1,0 +1,17 @@
+# Ignore Cargo build artifacts
+/target/
+/generated/
+Cargo.lock
+
+# Ignore generated Swift package
+/SwiftOpenMLS/
+
+# Ignore macOS files
+.DS_Store
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
