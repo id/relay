@@ -7,26 +7,22 @@ This repository contains the specification and reference implementation of **Rel
 Relay acts as the **Delivery Service** for MLS, providing:
 
 - **End-to-end encryption** via MLS (forward secrecy, post-compromise security)
-- **Metadata protection** via Sealed Sender (hides sender identity from broker)
 - **Asynchronous messaging** via KeyPackages (prekeys)
-- **DoS protection** via Proof-of-Work for unsolicited messages
 - **Standard MQTT 5.0** transport (works with any MQTT broker)
+- **Minimal protocol surface** - just MLS messages over MQTT topics
 
 ### Architecture
 
 ```
-+-------------------------------------------------------+
-|                 Application Layer                     |
-+-------------------------------------------------------+
-|           MLS Protocol (RFC 9420)                     |
-|  (Key Agreement, Forward Secrecy, Auth, Group State)  |
-+-------------------------------------------------------+
-|               Relay Privacy Layer                     |
-|  (Sealed Sender, Proof-of-Work, Metadata Protection)  |
-+-------------------------------------------------------+
-|               MQTT 5.0 (Transport)                    |
-|       (Routing, Pub/Sub, Reliability, Queuing)        |
-+-------------------------------------------------------+
+┌───────────────────────────────────────────────────────┐
+│                 Application Layer                     │
+├───────────────────────────────────────────────────────┤
+│             MLS Protocol (RFC 9420)                   │
+│  (Key Agreement, Forward Secrecy, Auth, Group State)  │
+├───────────────────────────────────────────────────────┤
+│                 MQTT 5.0 Transport                    │
+│         (Routing, Pub/Sub, Reliability)               │
+└───────────────────────────────────────────────────────┘
 ```
 
 ## Repository Structure
@@ -49,27 +45,18 @@ Relay uses the following MQTT topic structure:
 
 | Topic | Purpose | QoS | Retain |
 |-------|---------|-----|--------|
-| `relay/u/{user_id}/inbox` | Private messages & group invites | 1 | false |
-| `relay/u/{user_id}/keys` | Published KeyPackages (prekeys) | 1 | true |
+| `relay/k/{client_id}` | KeyPackages (prekeys) | 1 | true |
+| `relay/w/{client_id}` | Welcome messages | 1 | false |
 | `relay/g/{group_id}/m` | Group messages | 1 | false |
+| `relay/g/{group_id}/i` | GroupInfo | 1 | true |
 
 ## Security Model
 
-- **Broker is untrusted**: Confidentiality and integrity guaranteed by MLS + Sealed Sender
-- **Content privacy**: MLS encryption
-- **Metadata privacy**: Sealed Sender hides sender from broker
+- **Broker is untrusted**: Confidentiality and integrity guaranteed by MLS
+- **Content privacy**: All application messages encrypted via MLS PrivateMessage
+- **Client-centric**: Uses client IDs per RFC 9750 MLS Architecture
 - **Ordering**: MQTT broker provides message sequencing
 - **Availability**: Best-effort via MQTT QoS 1
-
-## Dependencies
-
-The reference implementation uses:
-
-- [Rust](https://www.rust-lang.org/) (2021 edition)
-- [OpenMLS](https://github.com/openmls/openmls) - MLS protocol implementation
-- [rumqttc](https://github.com/bytebeamio/rumqtt) - MQTT 5.0 client
-- [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) - Sealed Sender crypto
-- Standard Rust crypto crates (aes-gcm, hkdf, sha2)
 
 ## Status
 
@@ -77,7 +64,7 @@ This is an **experimental protocol** for research and demonstration purposes. Th
 
 ## License
 
-See LICENSE file for details.
+See [LICENSE](./LICENSE) file for details.
 
 ## Contributing
 
@@ -86,5 +73,6 @@ Contributions are welcome! Please open an issue or pull request.
 ## References
 
 - [RFC 9420: The Messaging Layer Security (MLS) Protocol](https://datatracker.ietf.org/doc/html/rfc9420)
+- [RFC 9750: The Messaging Layer Security (MLS) Architecture](https://datatracker.ietf.org/doc/html/rfc9750)
 - [MQTT Version 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)
 - [OpenMLS Documentation](https://openmls.tech/)
