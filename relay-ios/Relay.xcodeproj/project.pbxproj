@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		688143C12F0025F00051302D /* MQTT in Frameworks */ = {isa = PBXBuildFile; productRef = 688143C02F0025F00051302D /* MQTT */; };
+		688143DB2F0053820051302D /* SwiftOpenMLS in Frameworks */ = {isa = PBXBuildFile; productRef = 688143DA2F0053820051302D /* SwiftOpenMLS */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				688143C12F0025F00051302D /* MQTT in Frameworks */,
+				688143DB2F0053820051302D /* SwiftOpenMLS in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -118,6 +120,7 @@
 			name = Relay;
 			packageProductDependencies = (
 				688143C02F0025F00051302D /* MQTT */,
+				688143DA2F0053820051302D /* SwiftOpenMLS */,
 			);
 			productName = Relay;
 			productReference = 688143852F00253B0051302D /* Relay.app */;
@@ -203,6 +206,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				688143BF2F0025F00051302D /* XCRemoteSwiftPackageReference "swift-mqtt" */,
+				688143D92F0053820051302D /* XCLocalSwiftPackageReference "../swift-openmls/SwiftOpenMLS" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 688143862F00253B0051302D /* Products */;
@@ -580,6 +584,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		688143D92F0053820051302D /* XCLocalSwiftPackageReference "../swift-openmls/SwiftOpenMLS" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../swift-openmls/SwiftOpenMLS";
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		688143BF2F0025F00051302D /* XCRemoteSwiftPackageReference "swift-mqtt" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -596,6 +607,10 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 688143BF2F0025F00051302D /* XCRemoteSwiftPackageReference "swift-mqtt" */;
 			productName = MQTT;
+		};
+		688143DA2F0053820051302D /* SwiftOpenMLS */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = SwiftOpenMLS;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

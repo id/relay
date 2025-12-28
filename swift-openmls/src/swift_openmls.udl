@@ -35,6 +35,48 @@ dictionary DecryptedMessage {
     string sender_client_id;
 };
 
+dictionary JoinGroupResult {
+    string group_id;
+};
+
+// Stateful client that maintains identity and groups
+interface RelayMlsClient {
+    [Throws=OpenMlsError]
+    constructor(string client_id);
+    
+    // Get the client ID
+    string client_id();
+    
+    // Create a KeyPackage (CBOR-wrapped MLSMessage format per protocol)
+    [Throws=OpenMlsError]
+    sequence<u8> create_key_package();
+    
+    // Create a new group with random group_id, returns hex group_id
+    [Throws=OpenMlsError]
+    string create_group();
+    
+    // Add a member to a group, returns Welcome bytes to send to them
+    [Throws=OpenMlsError]
+    AddMemberResult add_member(string group_id, sequence<u8> key_package_bytes);
+    
+    // Join a group from a Welcome message, returns the group_id
+    [Throws=OpenMlsError]
+    JoinGroupResult join_from_welcome(sequence<u8> welcome_bytes);
+    
+    // Encrypt a message for a group
+    [Throws=OpenMlsError]
+    sequence<u8> encrypt(string group_id, sequence<u8> plaintext);
+    
+    // Decrypt a message from a group
+    [Throws=OpenMlsError]
+    DecryptedMessage decrypt(string group_id, sequence<u8> ciphertext);
+    
+    // Get list of member client IDs in a group
+    [Throws=OpenMlsError]
+    sequence<string> members(string group_id);
+};
+
+// Legacy interface - keep for backwards compatibility
 interface OpenMlsGroup {
     [Throws=OpenMlsError, Name=new]
     constructor(string group_id, string client_id);

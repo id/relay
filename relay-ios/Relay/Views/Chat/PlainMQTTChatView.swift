@@ -2,7 +2,7 @@ import Combine
 import SwiftData
 import SwiftUI
 
-struct ChatView: View {
+struct PlainMQTTChatView: View {
     @Environment(\.modelContext) private var modelContext
     @Bindable var conversation: Conversation
     @Bindable var mqttService: MQTTService
@@ -140,12 +140,6 @@ struct ChatView: View {
                 }
             }
 
-            if conversation.isEncrypted {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Image(systemName: "lock.fill")
-                        .foregroundStyle(.green)
-                }
-            }
         }
         .sheet(isPresented: $showingTopicsSheet) {
             TopicsSheet(conversation: conversation, mqttService: mqttService)
@@ -202,6 +196,7 @@ struct ChatView: View {
         Task {
             do {
                 try await mqttService.publish(to: topic, message: content)
+
                 await MainActor.run {
                     message.status = .sent
                 }
@@ -209,6 +204,7 @@ struct ChatView: View {
                 await MainActor.run {
                     message.status = .failed
                 }
+                print("Failed to send message: \(error)")
             }
         }
     }
@@ -230,13 +226,17 @@ struct ChatView: View {
             }
             .receive(on: DispatchQueue.main)
             .sink { [weak modelContext] incoming in
+                guard let modelContext = modelContext else { return }
+
+                // Plain text
                 guard
                     let content = String(
                         data: incoming.payload,
                         encoding: .utf8
-                    ),
-                    let modelContext = modelContext
-                else { return }
+                    )
+                else {
+                    return
+                }
 
                 // Don't add our own messages (they're already added when sent)
                 // In a real app, you'd have message IDs to deduplicate
@@ -462,7 +462,7 @@ struct MessageBubble: View {
 
 #Preview {
     NavigationStack {
-        ChatView(
+        PlainMQTTChatView(
             conversation: Conversation(
                 subscribeTopics: ["test/+/messages"],
                 publishTopic: "test/device1/messages",

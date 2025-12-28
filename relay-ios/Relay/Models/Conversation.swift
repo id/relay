@@ -5,6 +5,7 @@ import SwiftData
 final class Conversation {
     var id: UUID
     var peerClientId: String?
+    var groupId: String?  // MLS group ID (hex-encoded) for encrypted conversations
     var subscribeTopics: [String]  // Subscribe topics (can include wildcards like +, #)
     var publishTopic: String?  // Topic to publish to (no wildcards)
     var displayName: String
@@ -30,6 +31,7 @@ final class Conversation {
     init(
         id: UUID = UUID(),
         peerClientId: String? = nil,
+        groupId: String? = nil,
         subscribeTopics: [String] = [],
         publishTopic: String? = nil,
         displayName: String,
@@ -37,6 +39,7 @@ final class Conversation {
     ) {
         self.id = id
         self.peerClientId = peerClientId
+        self.groupId = groupId
         self.subscribeTopics = subscribeTopics
         self.publishTopic = publishTopic
         self.displayName = displayName
@@ -45,6 +48,16 @@ final class Conversation {
         self.unreadCount = 0
         self.isEncrypted = isEncrypted
         self.createdAt = Date()
+    }
+
+    /// Convenience initializer for Relay encrypted conversations
+    convenience init(name: String, topic: String, isEncrypted: Bool) {
+        self.init(
+            subscribeTopics: [topic],
+            publishTopic: topic,
+            displayName: name,
+            isEncrypted: isEncrypted
+        )
     }
 
     func updateLastMessage(_ content: String) {

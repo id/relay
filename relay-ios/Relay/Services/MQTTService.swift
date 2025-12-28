@@ -178,8 +178,21 @@ final class MQTTService: @unchecked Sendable {
 
     fileprivate func handleMessage(topic: String, payload: Data) {
         DispatchQueue.main.async { [weak self] in
+            print(
+                "[MQTT] Received message on topic: \(topic) (\(payload.count) bytes)"
+            )
             self?.receivedMessages.send((topic: topic, payload: payload))
+            self?.messageHandler?(topic, payload)
         }
+    }
+
+    // MARK: - Message Handler
+
+    private var messageHandler: ((String, Data) -> Void)?
+
+    /// Set a callback for incoming messages
+    func setMessageHandler(_ handler: @escaping (String, Data) -> Void) {
+        messageHandler = handler
     }
 
     fileprivate func handleError(_ error: Error) {
